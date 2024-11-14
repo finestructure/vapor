@@ -3,6 +3,7 @@ import NIOCore
 import NIOHTTP1
 import XCTest
 import Vapor
+import Dependencies
 
 extension Application: XCTApplicationTester {
     @available(*, noasync, message: "Use the async method instead.")
