@@ -404,6 +404,8 @@ public final class HTTPServer: Server, Sendable {
     }
 }
 
+import Dependencies
+
 private final class HTTPServerConnection: Sendable {
     let channel: Channel
     let quiesce: ServerQuiescingHelper
@@ -450,25 +452,31 @@ private final class HTTPServerConnection: Sendable {
                         configuration.logger.error("Could not configure TLS: \(error)")
                         return channel.close(mode: .all)
                     }
-                    return channel.pipeline.addHandler(tlsHandler).flatMap { _ in
-                        channel.configureHTTP2SecureUpgrade(h2ChannelConfigurator: { channel in
-                            channel.configureHTTP2Pipeline(
-                                mode: .server,
-                                inboundStreamInitializer: { channel in
-                                    return channel.pipeline.addVaporHTTP2Handlers(
+                    return withEscapedDependencies { dependencies in
+                        return channel.pipeline.addHandler(tlsHandler).flatMap { _ in
+                            channel.configureHTTP2SecureUpgrade(h2ChannelConfigurator: { channel in
+                                dependencies.yield {
+                                    channel.configureHTTP2Pipeline(
+                                        mode: .server,
+                                        inboundStreamInitializer: { channel in
+                                            return channel.pipeline.addVaporHTTP2Handlers(
+                                                application: application,
+                                                responder: responder,
+                                                configuration: configuration
+                                            )
+                                        }
+                                    ).map { _ in }
+                                }
+                            }, http1ChannelConfigurator: { channel in
+                                dependencies.yield {
+                                    return channel.pipeline.addVaporHTTP1Handlers(
                                         application: application,
                                         responder: responder,
                                         configuration: configuration
                                     )
                                 }
-                            ).map { _ in }
-                        }, http1ChannelConfigurator: { channel in
-                            return channel.pipeline.addVaporHTTP1Handlers(
-                                application: application,
-                                responder: responder,
-                                configuration: configuration
-                            )
-                        })
+                            })
+                        }
                     }
                 } else {
                     guard !configuration.supportVersions.contains(.two) else {
