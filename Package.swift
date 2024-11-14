@@ -59,8 +59,6 @@ let package = Package(
 
         // Low-level atomic operations
         .package(url: "https://github.com/apple/swift-atomics.git", from: "1.1.0"),
-
-            .package(url: "https://github.com/pointfreeco/swift-dependencies", exact: "1.4.1"),
     ],
     targets: [
         // C helpers
@@ -94,7 +92,6 @@ let package = Package(
                 .product(name: "Atomics", package: "swift-atomics"),
                 .product(name: "_NIOFileSystem", package: "swift-nio"),
                 .product(name: "_NIOFileSystemFoundationCompat", package: "swift-nio"),
-                .product(name: "Dependencies", package: "swift-dependencies"),
             ],
             swiftSettings: [.enableExperimentalFeature("StrictConcurrency=complete")]
         ),
