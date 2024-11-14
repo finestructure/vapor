@@ -7,6 +7,7 @@ import NIOSSL
 import Logging
 import NIOPosix
 import NIOConcurrencyHelpers
+import Dependencies
 
 public enum HTTPVersionMajor: Equatable, Hashable, Sendable {
     case one
@@ -415,94 +416,98 @@ private final class HTTPServerConnection: Sendable {
         configuration: HTTPServer.Configuration,
         on eventLoopGroup: EventLoopGroup
     ) -> EventLoopFuture<HTTPServerConnection> {
-        let quiesce = ServerQuiescingHelper(group: eventLoopGroup)
-        let bootstrap = ServerBootstrap(group: eventLoopGroup)
+        withEscapedDependencies { dependencies in
+            let quiesce = ServerQuiescingHelper(group: eventLoopGroup)
+            let bootstrap = ServerBootstrap(group: eventLoopGroup)
             /// Specify accepts per loop and backlog, and enable `SO_REUSEADDR` for the server itself.
-            .serverChannelOption(ChannelOptions.maxMessagesPerRead, value: configuration.connectionsPerServerTick)
-            .serverChannelOption(ChannelOptions.backlog, value: Int32(configuration.backlog))
-            .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: configuration.reuseAddress ? SocketOptionValue(1) : SocketOptionValue(0))
-            
-            /// Set handlers that are applied to the Server's channel.
-            .serverChannelInitializer { channel in
-                channel.pipeline.addHandler(quiesce.makeServerChannelHandler(channel: channel))
-            }
-            
-            /// Set the handlers that are applied to the accepted Channels.
-            .childChannelInitializer { [unowned application, unowned server] channel in
-                /// Copy the most up-to-date configuration.
-                let configuration = server.configuration
+                .serverChannelOption(ChannelOptions.maxMessagesPerRead, value: configuration.connectionsPerServerTick)
+                .serverChannelOption(ChannelOptions.backlog, value: Int32(configuration.backlog))
+                .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: configuration.reuseAddress ? SocketOptionValue(1) : SocketOptionValue(0))
 
-                /// Add TLS handlers if configured.
-                if var tlsConfiguration = configuration.tlsConfiguration {
-                    /// Prioritize http/2 if supported.
-                    if configuration.supportVersions.contains(.two) {
-                        tlsConfiguration.applicationProtocols.append("h2")
-                    }
-                    if configuration.supportVersions.contains(.one) {
-                        tlsConfiguration.applicationProtocols.append("http/1.1")
-                    }
-                    let sslContext: NIOSSLContext
-                    let tlsHandler: NIOSSLServerHandler
-                    do {
-                        sslContext = try NIOSSLContext(configuration: tlsConfiguration)
-                        tlsHandler = NIOSSLServerHandler(context: sslContext, customVerifyCallback: configuration.customCertificateVerifyCallback)
-                    } catch {
-                        configuration.logger.error("Could not configure TLS: \(error)")
-                        return channel.close(mode: .all)
-                    }
-                    return channel.pipeline.addHandler(tlsHandler).flatMap { _ in
-                        channel.configureHTTP2SecureUpgrade(h2ChannelConfigurator: { channel in
-                            channel.configureHTTP2Pipeline(
-                                mode: .server,
-                                inboundStreamInitializer: { channel in
-                                    return channel.pipeline.addVaporHTTP2Handlers(
+            /// Set handlers that are applied to the Server's channel.
+                .serverChannelInitializer { channel in
+                    channel.pipeline.addHandler(quiesce.makeServerChannelHandler(channel: channel))
+                }
+
+            /// Set the handlers that are applied to the accepted Channels.
+                .childChannelInitializer { [unowned application, unowned server] channel in
+                    dependencies.yield {
+                        /// Copy the most up-to-date configuration.
+                        let configuration = server.configuration
+
+                        /// Add TLS handlers if configured.
+                        if var tlsConfiguration = configuration.tlsConfiguration {
+                            /// Prioritize http/2 if supported.
+                            if configuration.supportVersions.contains(.two) {
+                                tlsConfiguration.applicationProtocols.append("h2")
+                            }
+                            if configuration.supportVersions.contains(.one) {
+                                tlsConfiguration.applicationProtocols.append("http/1.1")
+                            }
+                            let sslContext: NIOSSLContext
+                            let tlsHandler: NIOSSLServerHandler
+                            do {
+                                sslContext = try NIOSSLContext(configuration: tlsConfiguration)
+                                tlsHandler = NIOSSLServerHandler(context: sslContext, customVerifyCallback: configuration.customCertificateVerifyCallback)
+                            } catch {
+                                configuration.logger.error("Could not configure TLS: \(error)")
+                                return channel.close(mode: .all)
+                            }
+                            return channel.pipeline.addHandler(tlsHandler).flatMap { _ in
+                                channel.configureHTTP2SecureUpgrade(h2ChannelConfigurator: { channel in
+                                    channel.configureHTTP2Pipeline(
+                                        mode: .server,
+                                        inboundStreamInitializer: { channel in
+                                            return channel.pipeline.addVaporHTTP2Handlers(
+                                                application: application,
+                                                responder: responder,
+                                                configuration: configuration
+                                            )
+                                        }
+                                    ).map { _ in }
+                                }, http1ChannelConfigurator: { channel in
+                                    return channel.pipeline.addVaporHTTP1Handlers(
                                         application: application,
                                         responder: responder,
                                         configuration: configuration
                                     )
-                                }
-                            ).map { _ in }
-                        }, http1ChannelConfigurator: { channel in
+                                })
+                            }
+                        } else {
+                            guard !configuration.supportVersions.contains(.two) else {
+                                fatalError("Plaintext HTTP/2 (h2c) not yet supported.")
+                            }
                             return channel.pipeline.addVaporHTTP1Handlers(
                                 application: application,
                                 responder: responder,
                                 configuration: configuration
                             )
-                        })
+                        }
                     }
-                } else {
-                    guard !configuration.supportVersions.contains(.two) else {
-                        fatalError("Plaintext HTTP/2 (h2c) not yet supported.")
-                    }
-                    return channel.pipeline.addVaporHTTP1Handlers(
-                        application: application,
-                        responder: responder,
-                        configuration: configuration
-                    )
                 }
-            }
-            
+
             /// Enable `TCP_NODELAY` and `SO_REUSEADDR` for the accepted Channels.
-            .childChannelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: configuration.tcpNoDelay ? SocketOptionValue(1) : SocketOptionValue(0))
-            .childChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: configuration.reuseAddress ? SocketOptionValue(1) : SocketOptionValue(0))
-            .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
-        
-        let channel: EventLoopFuture<Channel>
-        switch configuration.address {
-        case .hostname:
-            channel = bootstrap.bind(host: configuration.hostname, port: configuration.port)
-        case .unixDomainSocket(let socketPath):
-            channel = bootstrap.bind(unixDomainSocketPath: socketPath)
-        }
-        
-        return channel.map { channel in
-            return .init(channel: channel, quiesce: quiesce)
-        }.flatMapErrorThrowing { error -> HTTPServerConnection in
-            quiesce.initiateShutdown(promise: nil)
-            throw error
+                .childChannelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: configuration.tcpNoDelay ? SocketOptionValue(1) : SocketOptionValue(0))
+                .childChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: configuration.reuseAddress ? SocketOptionValue(1) : SocketOptionValue(0))
+                .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
+
+            let channel: EventLoopFuture<Channel>
+            switch configuration.address {
+                case .hostname:
+                    channel = bootstrap.bind(host: configuration.hostname, port: configuration.port)
+                case .unixDomainSocket(let socketPath):
+                    channel = bootstrap.bind(unixDomainSocketPath: socketPath)
+            }
+
+            return channel.map { channel in
+                return .init(channel: channel, quiesce: quiesce)
+            }.flatMapErrorThrowing { error -> HTTPServerConnection in
+                quiesce.initiateShutdown(promise: nil)
+                throw error
+            }
         }
     }
-    
+
     init(channel: Channel, quiesce: ServerQuiescingHelper) {
         self.channel = channel
         self.quiesce = quiesce
